@@ -5,36 +5,71 @@ import StockSearch from '../components/StockSearch'
 import MetricCard from '../components/MetricCard'
 import OHLCVTable from '../components/OHLCVTable'
 
-const API = process.env.NEXT_PUBLIC_API_URL || 'https://your-space.hf.space'
+const API = (process.env.NEXT_PUBLIC_API_URL || '').replace(/\/+$/, '')
 
 const STATUS_LABELS = {
-  queued:       'Queued…',
-  loading_data: 'Downloading market data…',
+  queued:               'Queued…',
+  loading_data:         'Downloading market data…',
   training_fold_1_of_3: 'Training fold 1 of 3…',
   training_fold_2_of_3: 'Training fold 2 of 3…',
   training_fold_3_of_3: 'Training fold 3 of 3…',
-  predicting:   'Running predictions…',
-  done:         'Complete',
-  error:        'Error',
+  predicting:           'Running predictions…',
+  done:                 'Complete',
+  error:                'Error',
 }
 
 export default function Home() {
-  const [symbols, setSymbols]     = useState([])
-  const [ticker,  setTicker]      = useState('')
-  const [model,   setModel]       = useState('GRU')
-  const [bidir,   setBidir]       = useState(false)
-  const [jobId,   setJobId]       = useState(null)
-  const [status,  setStatus]      = useState(null)
-  const [result,  setResult]      = useState(null)
-  const [error,   setError]       = useState(null)
-  const [loading, setLoading]     = useState(false)
+  const [symbols, setSymbols] = useState([])
+  const [ticker,  setTicker]  = useState('')
+  const [model,   setModel]   = useState('GRU')
+  const [bidir,   setBidir]   = useState(false)
+  const [jobId,   setJobId]   = useState(null)
+  const [status,  setStatus]  = useState(null)
+  const [result,  setResult]  = useState(null)
+  const [error,   setError]   = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [apiWarn, setApiWarn] = useState('')
   const pollRef = useRef(null)
 
+  // ── Load symbols: CSV first (always works), then API if available ──
   useEffect(() => {
-    fetch(`${API}/symbols`)
-      .then(r => r.json())
-      .then(d => { setSymbols(d.symbols); setTicker(d.symbols[0]?.value || '') })
-      .catch(() => {})
+    const loadCSV = async () => {
+      try {
+        const res  = await fetch('/nifty.csv')
+        const text = await res.text()
+        const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+        const syms = lines
+          .filter(l => l !== 'Symbol' && l.length > 2)
+          .map(s => ({ label: s.replace('.NS', ''), value: s }))
+        if (syms.length > 0) {
+          setSymbols(syms)
+          setTicker(syms[0].value)
+        }
+      } catch (e) {
+        console.error('CSV load failed', e)
+      }
+    }
+
+    const loadAPI = async () => {
+      if (!API) {
+        setApiWarn('⚠ NEXT_PUBLIC_API_URL not set in Vercel — predictions will not work.')
+        return
+      }
+      try {
+        const r = await fetch(`${API}/symbols`, { signal: AbortSignal.timeout(8000) })
+        if (!r.ok) throw new Error('bad status')
+        const d = await r.json()
+        if (d.symbols?.length > 0) {
+          setSymbols(d.symbols)
+          setTicker(d.symbols[0].value)
+        }
+      } catch (e) {
+        // API down — CSV fallback already loaded, just warn
+        setApiWarn('HuggingFace API unreachable — stocks loaded from local CSV. Predictions may fail if Space is sleeping.')
+      }
+    }
+
+    loadCSV().then(loadAPI)
   }, [])
 
   const poll = useCallback((jid) => {
@@ -54,7 +89,7 @@ export default function Home() {
         }
       } catch (e) {
         clearInterval(pollRef.current)
-        setError('Lost connection to API')
+        setError('Lost connection to API. The HuggingFace Space may have gone to sleep — refresh and try again.')
         setLoading(false)
       }
     }, 3000)
@@ -62,6 +97,10 @@ export default function Home() {
 
   const handlePredict = async () => {
     if (!ticker) return
+    if (!API) {
+      setError('NEXT_PUBLIC_API_URL is not set. Go to Vercel → Settings → Environment Variables, add it, then redeploy.')
+      return
+    }
     clearInterval(pollRef.current)
     setLoading(true)
     setResult(null)
@@ -77,7 +116,7 @@ export default function Home() {
       setJobId(d.job_id)
       poll(d.job_id)
     } catch (e) {
-      setError('Could not reach the API. Is the HuggingFace Space awake?')
+      setError('Could not reach the HuggingFace API. The Space may be starting up — wait 30 seconds and try again.')
       setLoading(false)
     }
   }
@@ -91,7 +130,7 @@ export default function Home() {
 
   return (
     <div className="min-h-screen" style={{ background: '#0a0f1a' }}>
-      {/* ── Header ─────────────────────────────────────────────── */}
+      {/* ── Header ── */}
       <header style={{
         borderBottom: '1px solid #1e293b',
         background: 'rgba(10,15,26,0.95)',
@@ -103,16 +142,11 @@ export default function Home() {
             <div style={{
               width: 36, height: 36, borderRadius: 10,
               background: 'linear-gradient(135deg,#16a34a,#0d9488)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 18,
+              display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18,
             }}>📈</div>
             <div>
-              <div style={{ fontWeight: 600, fontSize: 16, letterSpacing: '-0.02em', color: '#f1f5f9' }}>
-                StockSeer
-              </div>
-              <div style={{ fontSize: 11, color: '#64748b', letterSpacing: '0.05em' }}>
-                AI · NIFTY STOCKS
-              </div>
+              <div style={{ fontWeight: 600, fontSize: 16, letterSpacing: '-0.02em', color: '#f1f5f9' }}>StockSeer</div>
+              <div style={{ fontSize: 11, color: '#64748b', letterSpacing: '0.05em' }}>AI · NIFTY STOCKS</div>
             </div>
           </div>
           <div style={{ fontSize: 12, color: '#475569' }}>
@@ -122,29 +156,34 @@ export default function Home() {
       </header>
 
       <main className="max-w-6xl mx-auto px-6 py-10">
-        {/* ── Control Panel ───────────────────────────────────── */}
+
+        {/* ── API warning banner ── */}
+        {apiWarn && (
+          <div style={{
+            background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.3)',
+            borderRadius: 10, padding: '10px 16px', marginBottom: 20,
+            fontSize: 13, color: '#fbbf24', display: 'flex', alignItems: 'center', gap: 8,
+          }}>
+            ⚠ {apiWarn}
+          </div>
+        )}
+
+        {/* ── Control Panel ── */}
         <div style={{
-          background: '#111827',
-          border: '1px solid #1e293b',
-          borderRadius: 16,
-          padding: '24px 28px',
-          marginBottom: 32,
+          background: '#111827', border: '1px solid #1e293b',
+          borderRadius: 16, padding: '24px 28px', marginBottom: 32,
         }}>
           <div style={{ fontSize: 12, fontWeight: 500, color: '#64748b', letterSpacing: '0.08em', marginBottom: 20 }}>
             CONFIGURE PREDICTION
           </div>
           <div className="flex flex-wrap gap-4 items-end">
-            {/* Stock */}
+
+            {/* Stock search */}
             <div className="flex-1" style={{ minWidth: 240 }}>
               <label style={{ fontSize: 12, color: '#94a3b8', display: 'block', marginBottom: 8 }}>
                 Stock <span style={{ color: '#475569' }}>({symbols.length} available)</span>
               </label>
-              <StockSearch
-                symbols={symbols}
-                value={ticker}
-                onChange={setTicker}
-                disabled={loading}
-              />
+              <StockSearch symbols={symbols} value={ticker} onChange={setTicker} disabled={loading} />
             </div>
 
             {/* Model */}
@@ -163,7 +202,7 @@ export default function Home() {
               </select>
             </div>
 
-            {/* Bidir toggle */}
+            {/* Bidir */}
             <div style={{ minWidth: 130 }}>
               <label style={{ fontSize: 12, color: '#94a3b8', display: 'block', marginBottom: 8 }}>Bidirectional</label>
               <button
@@ -171,11 +210,9 @@ export default function Home() {
                 disabled={loading || !['GRU','LSTM'].includes(model)}
                 style={{
                   width: '100%', padding: '10px 12px', borderRadius: 8, fontSize: 14, cursor: 'pointer',
-                  border: '1px solid',
-                  borderColor: bidir ? '#16a34a' : '#1e293b',
-                  background:  bidir ? 'rgba(22,163,74,0.12)' : '#0f172a',
-                  color:       bidir ? '#4ade80' : '#64748b',
-                  fontWeight:  500,
+                  border: '1px solid', borderColor: bidir ? '#16a34a' : '#1e293b',
+                  background: bidir ? 'rgba(22,163,74,0.12)' : '#0f172a',
+                  color: bidir ? '#4ade80' : '#64748b', fontWeight: 500,
                   opacity: !['GRU','LSTM'].includes(model) ? 0.4 : 1,
                 }}
               >
@@ -190,45 +227,35 @@ export default function Home() {
               style={{
                 padding: '10px 28px', borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: 'pointer',
                 background: loading ? '#1e293b' : 'linear-gradient(135deg,#16a34a,#0d9488)',
-                color: loading ? '#64748b' : '#fff',
-                border: 'none',
-                minWidth: 140,
-                transition: 'all 0.2s',
+                color: loading ? '#64748b' : '#fff', border: 'none', minWidth: 140, transition: 'all 0.2s',
               }}
             >
               {loading ? 'Running…' : '▶ Predict'}
             </button>
           </div>
 
-          {/* Status bar */}
+          {/* Status / error bar */}
           {(loading || error) && (
             <div style={{ marginTop: 20, display: 'flex', alignItems: 'center', gap: 10 }}>
               {loading && (
                 <>
-                  <div className="pulse-dot" style={{
-                    width: 8, height: 8, borderRadius: '50%', background: '#16a34a',
-                  }} />
-                  <span style={{ fontSize: 13, color: '#94a3b8' }}>
-                    {STATUS_LABELS[status] || status || 'Processing…'}
-                  </span>
+                  <div className="pulse-dot" style={{ width: 8, height: 8, borderRadius: '50%', background: '#16a34a' }} />
+                  <span style={{ fontSize: 13, color: '#94a3b8' }}>{STATUS_LABELS[status] || status || 'Processing…'}</span>
                 </>
               )}
-              {error && (
-                <span style={{ fontSize: 13, color: '#f87171' }}>⚠ {error}</span>
-              )}
+              {error && <span style={{ fontSize: 13, color: '#f87171' }}>⚠ {error}</span>}
             </div>
           )}
         </div>
 
-        {/* ── Results ─────────────────────────────────────────── */}
+        {/* ── Results ── */}
         {result && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
             {/* Prediction hero */}
             <div style={{
               background: '#111827', border: '1px solid #1e293b',
               borderRadius: 16, padding: '28px 32px',
-              display: 'flex', flexWrap: 'wrap', alignItems: 'center',
-              justifyContent: 'space-between', gap: 24,
+              display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 24,
             }}>
               <div>
                 <div style={{ fontSize: 12, color: '#64748b', letterSpacing: '0.08em', marginBottom: 8 }}>
@@ -238,10 +265,7 @@ export default function Home() {
                   <span style={{ fontSize: 48, fontWeight: 700, color: '#f1f5f9', letterSpacing: '-0.04em' }}>
                     ₹{result.future_price.toLocaleString('en-IN')}
                   </span>
-                  <span style={{
-                    fontSize: 18, fontWeight: 600,
-                    color: bullish ? '#4ade80' : '#f87171',
-                  }}>
+                  <span style={{ fontSize: 18, fontWeight: 600, color: bullish ? '#4ade80' : '#f87171' }}>
                     {bullish ? '▲' : '▼'} {Math.abs(priceChange)}%
                   </span>
                 </div>
@@ -267,32 +291,22 @@ export default function Home() {
 
             {/* Metrics */}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(160px,1fr))', gap: 16 }}>
-              <MetricCard label="MAPE"      value={`${result.mape}%`}   sub="Mean Abs % Error" />
-              <MetricCard label="RMSE"      value={`₹${result.rmse}`}   sub="Root Mean Sq Error" />
+              <MetricCard label="MAPE"      value={`${result.mape}%`}  sub="Mean Abs % Error" />
+              <MetricCard label="RMSE"      value={`₹${result.rmse}`}  sub="Root Mean Sq Error" />
               <MetricCard label="Dir. Acc." value={`${result.directional_accuracy}%`} sub="Directional Accuracy" accent={result.directional_accuracy > 55} />
-              <MetricCard label="Model"     value={result.model_type}   sub={result.bidirectional ? 'Bidirectional' : 'Unidirectional'} />
+              <MetricCard label="Model"     value={result.model_type}  sub={result.bidirectional ? 'Bidirectional' : 'Unidirectional'} />
             </div>
 
             {/* Chart */}
-            <div style={{
-              background: '#111827', border: '1px solid #1e293b',
-              borderRadius: 16, padding: '24px 28px',
-            }}>
+            <div style={{ background: '#111827', border: '1px solid #1e293b', borderRadius: 16, padding: '24px 28px' }}>
               <div style={{ fontSize: 12, fontWeight: 500, color: '#64748b', letterSpacing: '0.08em', marginBottom: 20 }}>
                 ACTUAL vs PREDICTED (TEST SET)
               </div>
-              <PredictionChart
-                dates={result.chart_dates}
-                actual={result.chart_actual}
-                predicted={result.chart_pred}
-              />
+              <PredictionChart dates={result.chart_dates} actual={result.chart_actual} predicted={result.chart_pred} />
             </div>
 
             {/* OHLCV */}
-            <div style={{
-              background: '#111827', border: '1px solid #1e293b',
-              borderRadius: 16, padding: '24px 28px',
-            }}>
+            <div style={{ background: '#111827', border: '1px solid #1e293b', borderRadius: 16, padding: '24px 28px' }}>
               <div style={{ fontSize: 12, fontWeight: 500, color: '#64748b', letterSpacing: '0.08em', marginBottom: 20 }}>
                 RECENT OHLCV (LAST 30 DAYS)
               </div>
