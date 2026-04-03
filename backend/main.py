@@ -97,12 +97,63 @@ def feature_selection(df):
 def inverse_transform(preds, col_idx, scaler):
     return np.array(preds).flatten() * scaler.scale_[col_idx] + scaler.mean_[col_idx]
 
+def _download_with_retry(ticker: str) -> pd.DataFrame:
+    """Try multiple strategies to download data, returning OHLCV DataFrame."""
+    errors = []
+
+    # Strategy 1: curl_cffi browser impersonation (beats Yahoo IP blocks)
+    try:
+        from curl_cffi import requests as cffi_requests
+        session = cffi_requests.Session(impersonate="chrome")
+        t = yf.Ticker(ticker, session=session)
+        df = t.history(period="5y", auto_adjust=True)
+        if not df.empty:
+            df.index = pd.to_datetime(df.index.tz_localize(None) if df.index.tzinfo else df.index)
+            return df
+    except Exception as e:
+        errors.append(f"curl_cffi: {e}")
+
+    # Strategy 2: yf.download with different periods
+    for period in ["5y", "2y", "1y"]:
+        try:
+            df = yf.download(ticker, period=period, interval="1d",
+                             auto_adjust=True, progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] for c in df.columns]
+            if not df.empty:
+                return df
+        except Exception as e:
+            errors.append(f"yf.download period={period}: {e}")
+
+    # Strategy 3: Ticker.history with explicit dates
+    try:
+        import datetime
+        end   = datetime.date.today()
+        start = end - datetime.timedelta(days=365 * 5)
+        t  = yf.Ticker(ticker)
+        df = t.history(start=str(start), end=str(end), auto_adjust=True)
+        if not df.empty:
+            df.index = pd.to_datetime(df.index.tz_localize(None) if df.index.tzinfo else df.index)
+            return df
+    except Exception as e:
+        errors.append(f"Ticker.history: {e}")
+
+    raise ValueError(f"Could not download data for {ticker}. Tried:\n" + "\n".join(errors))
+
+
 def load_data(ticker):
-    df = yf.download(ticker, period="5y", interval="1d", auto_adjust=True)
+    df = _download_with_retry(ticker)
     if df.empty:
         raise ValueError(f"No data for {ticker}")
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
+    # Normalise column names (history() returns Open/High/Low/Close/Volume directly)
+    col_map = {c: c.capitalize() for c in df.columns}
+    df = df.rename(columns=col_map)
+    required = {"Open","High","Low","Close","Volume"}
+    missing  = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Downloaded data missing columns: {missing}. Got: {list(df.columns)}")
     df = df[["Open","High","Low","Close","Volume"]]
     df = df[df["Close"].between(df["Close"].quantile(0.005), df["Close"].quantile(0.995))]
     df = add_indicators(df)
