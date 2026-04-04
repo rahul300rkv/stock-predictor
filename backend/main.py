@@ -1,17 +1,15 @@
-import os, warnings, uuid
+import os, warnings, uuid, requests
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import yfinance as yf
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_squared_error
+from sklearn.linear_model import Ridge, LogisticRegression
 from pandas.tseries.offsets import BDay
 
 warnings.filterwarnings("ignore")
@@ -27,6 +25,95 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
 jobs: dict = {}
+
+# ── Twelve Data key rotation ──────────────────────────────────────────────────
+# Add as many keys as you have accounts - they rotate automatically
+TD_KEYS = [k.strip() for k in [
+    os.environ.get("TWELVEDATA_API_KEY_1", ""),
+    os.environ.get("TWELVEDATA_API_KEY_2", ""),
+    os.environ.get("TWELVEDATA_API_KEY_3", ""),  # add more if needed
+] if k.strip()]
+
+_key_index = 0  # current active key
+
+def get_next_key():
+    """Rotate to next available key."""
+    global _key_index
+    if not TD_KEYS:
+        raise ValueError("No Twelve Data API keys set. Add TWELVEDATA_API_KEY_1 and TWELVEDATA_API_KEY_2 in Render environment variables.")
+    _key_index = (_key_index + 1) % len(TD_KEYS)
+    return TD_KEYS[_key_index]
+
+def fetch_ohlcv(symbol: str) -> pd.DataFrame:
+    """
+    Fetch 5 years of daily OHLCV from Twelve Data.
+    Automatically rotates API keys if one hits rate limit.
+    symbol: NSE symbol e.g. 'RELIANCE.NS' or 'RELIANCE'
+    """
+    clean = symbol.upper().replace(".NS", "").replace(".BO", "").replace(".BSE", "")
+
+    last_error = None
+    # Try each key up to 2 full rotations
+    attempts = len(TD_KEYS) * 2 if TD_KEYS else 1
+
+    for attempt in range(attempts):
+        key = TD_KEYS[_key_index % len(TD_KEYS)] if TD_KEYS else ""
+        try:
+            resp = requests.get(
+                "https://api.twelvedata.com/time_series",
+                params={
+                    "symbol":     clean,
+                    "exchange":   "NSE",
+                    "interval":   "1day",
+                    "outputsize": 1260,      # ~5 years trading days
+                    "apikey":     key,
+                    "format":     "JSON",
+                    "order":      "ASC",
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Rate limit hit → rotate key and retry
+            if data.get("code") in [429, 400] or "rate limit" in str(data.get("message","")).lower():
+                print(f"Key {_key_index} rate limited, rotating...")
+                get_next_key()
+                last_error = data.get("message", "Rate limit")
+                continue
+
+            if data.get("status") == "error":
+                raise ValueError(f"Twelve Data error: {data.get('message', 'Unknown')}")
+
+            values = data.get("values")
+            if not values:
+                raise ValueError(f"No data returned for {clean} on NSE.")
+
+            df = pd.DataFrame(values)
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df = df.set_index("datetime").sort_index()
+            df = df.rename(columns={
+                "open": "Open", "high": "High",
+                "low":  "Low",  "close": "Close", "volume": "Volume"
+            })
+            for col in ["Open", "High", "Low", "Close", "Volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+            if df.empty:
+                raise ValueError(f"Empty data for {clean}")
+
+            print(f"Fetched {len(df)} rows for {clean} using key index {_key_index}")
+            return df
+
+        except ValueError:
+            raise
+        except Exception as e:
+            last_error = str(e)
+            get_next_key()
+            continue
+
+    raise ValueError(f"All Twelve Data keys failed. Last error: {last_error}")
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 def compute_rsi(series, period=14):
@@ -59,34 +146,34 @@ def compute_adx(high, low, close, period=14):
 
 def add_indicators(df):
     df = df.copy()
-    df["RSI"]          = compute_rsi(df["Close"])
+    df["RSI"]           = compute_rsi(df["Close"])
     df["MACD"], df["MACD_signal"] = compute_macd(df["Close"])
-    df["MACD_Hist"]    = df["MACD"] - df["MACD_signal"]
-    df["EMA_10"]       = df["Close"].ewm(span=10, adjust=False).mean()
-    df["EMA_50"]       = df["Close"].ewm(span=30, adjust=False).mean()
-    df["Crossover"]    = np.where(df["EMA_10"] > df["EMA_50"], 1, 0).astype(float)
-    df["ATR"]          = compute_atr(df["High"], df["Low"], df["Close"])
-    df["ATR_Norm"]     = df["ATR"] / df["Close"]
-    df["ADX"]          = compute_adx(df["High"], df["Low"], df["Close"])
-    df["Momentum"]     = df["Close"].pct_change(3)
-    df["VWAP"]         = (df["Close"] * df["Volume"]).cumsum() / df["Volume"].cumsum()
+    df["MACD_Hist"]     = df["MACD"] - df["MACD_signal"]
+    df["EMA_10"]        = df["Close"].ewm(span=10, adjust=False).mean()
+    df["EMA_50"]        = df["Close"].ewm(span=30, adjust=False).mean()
+    df["Crossover"]     = np.where(df["EMA_10"] > df["EMA_50"], 1, 0).astype(float)
+    df["ATR"]           = compute_atr(df["High"], df["Low"], df["Close"])
+    df["ATR_Norm"]      = df["ATR"] / df["Close"]
+    df["ADX"]           = compute_adx(df["High"], df["Low"], df["Close"])
+    df["Momentum"]      = df["Close"].pct_change(3)
+    df["VWAP"]          = (df["Close"] * df["Volume"]).cumsum() / df["Volume"].cumsum()
     ll = df["Low"].rolling(14).min(); hh = df["High"].rolling(14).max()
-    df["Stochastic"]   = (100 * (df["Close"] - ll) / (hh - ll).replace(0, np.nan)).fillna(50)
-    df["ROC"]          = df["Close"].pct_change(5) * 100
+    df["Stochastic"]    = (100 * (df["Close"] - ll) / (hh - ll).replace(0, np.nan)).fillna(50)
+    df["ROC"]           = df["Close"].pct_change(5) * 100
     hh2 = df["High"].rolling(14).max(); ll2 = df["Low"].rolling(14).min()
-    df["Williams_R"]   = (-100 * (hh2 - df["Close"]) / (hh2 - ll2).replace(0, np.nan)).fillna(-50)
-    df["OBV"]          = (np.sign(df["Close"].diff()) * df["Volume"]).cumsum()
+    df["Williams_R"]    = (-100 * (hh2 - df["Close"]) / (hh2 - ll2).replace(0, np.nan)).fillna(-50)
+    df["OBV"]           = (np.sign(df["Close"].diff()) * df["Volume"]).cumsum()
     df["Volatility_20"] = df["Close"].rolling(20).std()
     ma20 = df["Close"].rolling(20).mean()
-    df["BB_High"]      = ma20 + 2 * df["Volatility_20"]
-    df["BB_Low"]       = ma20 - 2 * df["Volatility_20"]
+    df["BB_High"]       = ma20 + 2 * df["Volatility_20"]
+    df["BB_Low"]        = ma20 - 2 * df["Volatility_20"]
     for lag in range(1, 6):
         df[f"Lag_Close_{lag}"]  = df["Close"].shift(lag)
         df[f"Lag_Volume_{lag}"] = df["Volume"].shift(lag)
-    df["DayOfWeek"]    = df.index.dayofweek.astype(float)
-    df["Month"]        = df.index.month.astype(float)
-    df["IsMonthEnd"]   = df.index.is_month_end.astype(float)
-    df["IsMonthStart"] = df.index.is_month_start.astype(float)
+    df["DayOfWeek"]     = df.index.dayofweek.astype(float)
+    df["Month"]         = df.index.month.astype(float)
+    df["IsMonthEnd"]    = df.index.is_month_end.astype(float)
+    df["IsMonthStart"]  = df.index.is_month_start.astype(float)
     return df.ffill().fillna(0).dropna()
 
 def feature_selection(df):
@@ -97,7 +184,6 @@ def feature_selection(df):
     return list(set(selected + must))
 
 def make_flat_features(scaled, n_steps, close_idx):
-    """Flatten sliding windows into 2D for sklearn models."""
     X, yr = [], []
     for i in range(n_steps, len(scaled) - LOOKUP_STEP + 1):
         X.append(scaled[i - n_steps:i].flatten())
@@ -109,17 +195,7 @@ def inverse_transform(preds, col_idx, scaler):
 
 def load_data(ticker):
     ticker = ticker.upper().strip()
-    if not ticker.endswith(".NS") and not ticker.endswith(".BO"):
-        ticker = ticker + ".NS"
-
-    df = yf.download(ticker, period="5y", interval="1d",
-                     auto_adjust=True, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-    if df.empty:
-        raise ValueError(f"No data returned for {ticker}. Check the symbol.")
-
-    df = df[["Open","High","Low","Close","Volume"]]
+    df = fetch_ohlcv(ticker)
     df = df[df["Close"].between(df["Close"].quantile(0.005),
                                 df["Close"].quantile(0.995))]
     df = add_indicators(df)
@@ -139,15 +215,30 @@ def load_data(ticker):
     cidx   = fcols.index("Close")
 
     X_flat, yr = make_flat_features(scaled, N_STEPS, cidx)
-    yc = df_label.values[N_STEPS: N_STEPS + len(yr)]
+    yc    = df_label.values[N_STEPS: N_STEPS + len(yr)]
+    dates = df_feat.index[N_STEPS: N_STEPS + len(yr)]
 
     n = max(1, int(TEST_SIZE * len(X_flat)))
-    dates = df.index[N_STEPS: N_STEPS + len(yr)]
-
     return (X_flat[:-n], X_flat[-n:],
             yr[:-n],     yr[-n:],
             yc[:-n],     yc[-n:],
             scaler, dates, df, cidx)
+
+def get_models(mtype):
+    if mtype in ["GRU", "LSTM"]:
+        reg = GradientBoostingRegressor(n_estimators=200, max_depth=4,
+                                        learning_rate=0.05, random_state=42)
+        clf = GradientBoostingClassifier(n_estimators=200, max_depth=4,
+                                         learning_rate=0.05, random_state=42)
+    elif mtype == "Conv1D":
+        reg = RandomForestRegressor(n_estimators=200, max_depth=8,
+                                    random_state=42, n_jobs=-1)
+        clf = RandomForestClassifier(n_estimators=200, max_depth=8,
+                                     random_state=42, n_jobs=-1)
+    else:
+        reg = Ridge(alpha=1.0)
+        clf = LogisticRegression(C=1.0, max_iter=500)
+    return reg, clf
 
 def run_job(job_id, ticker, mtype, bidir):
     try:
@@ -155,46 +246,22 @@ def run_job(job_id, ticker, mtype, bidir):
         X_tr, X_te, yr_tr, yr_te, yc_tr, yc_te, scaler, dates, df, cidx = load_data(ticker)
 
         tscv = TimeSeriesSplit(n_splits=N_FOLDS)
-        reg_preds_list = []
-        clf_preds_list = []
+        reg_preds, clf_preds = [], []
+        final_reg = final_clf = None
 
         for fold, (ti, vi) in enumerate(tscv.split(X_tr)):
             jobs[job_id]["status"] = f"training_fold_{fold+1}_of_{N_FOLDS}"
-
-            # Regression model
-            if mtype == "GRU" or mtype == "LSTM":
-                reg = GradientBoostingRegressor(n_estimators=200, max_depth=4,
-                                                learning_rate=0.05, random_state=42)
-            elif mtype == "Conv1D":
-                reg = RandomForestRegressor(n_estimators=200, max_depth=8,
-                                            random_state=42, n_jobs=-1)
-            else:
-                reg = Ridge(alpha=1.0)
-
+            reg, clf = get_models(mtype)
             reg.fit(X_tr[ti], yr_tr[ti])
-            reg_preds_list.append(reg.predict(X_te))
-
-            # Classification model
-            if mtype in ["GRU", "LSTM"]:
-                clf = GradientBoostingClassifier(n_estimators=200, max_depth=4,
-                                                 learning_rate=0.05, random_state=42)
-            elif mtype == "Conv1D":
-                clf = RandomForestClassifier(n_estimators=200, max_depth=8,
-                                             random_state=42, n_jobs=-1)
-            else:
-                from sklearn.linear_model import LogisticRegression
-                clf = LogisticRegression(C=1.0, max_iter=500)
-
             clf.fit(X_tr[ti], yc_tr[ti])
-            clf_preds_list.append(clf.predict_proba(X_te)[:, 1])
+            reg_preds.append(reg.predict(X_te))
+            clf_preds.append(clf.predict_proba(X_te)[:, 1])
+            final_reg, final_clf = reg, clf  # keep last fold for future pred
 
         jobs[job_id]["status"] = "predicting"
-
-        # Ensemble average across folds
-        yrp = np.mean(reg_preds_list, axis=0)
-        ycp = np.mean(clf_preds_list, axis=0)
-        direction = (ycp > 0.5).astype(int)
-        adj = yrp * (1 + 0.1 * (2 * direction - 1))
+        yrp = np.mean(reg_preds, axis=0)
+        ycp = np.mean(clf_preds, axis=0)
+        adj = yrp * (1 + 0.1 * (2 * (ycp > 0.5).astype(int) - 1))
 
         ya = inverse_transform(adj, cidx, scaler)
         yt = inverse_transform(yr_te, cidx, scaler)
@@ -204,16 +271,12 @@ def run_job(job_id, ticker, mtype, bidir):
         rmse = float(np.sqrt(np.mean((yt - ya) ** 2)))
         da   = float(np.mean(np.sign(yt[1:] - yt[:-1]) == np.sign(ya[1:] - ya[:-1])) * 100)
 
-        # Future prediction
-        fut_reg = np.mean([reg.predict(X_te[-1:]) for reg in
-                           [GradientBoostingRegressor(n_estimators=200, max_depth=4,
-                            learning_rate=0.05, random_state=42).fit(X_tr, yr_tr)]], axis=0)
-        fut_clf_prob = GradientBoostingClassifier(n_estimators=200, max_depth=4,
-                       learning_rate=0.05, random_state=42).fit(X_tr, yc_tr).predict_proba(X_te[-1:])[:, 1]
-        fut_dir = (fut_clf_prob > 0.5).astype(int)
-        fut_adj = fut_reg * (1 + 0.1 * (2 * fut_dir - 1))
-        fp  = float(inverse_transform(fut_adj, cidx, scaler)[0])
-        fd  = (dates[-1] + BDay(LOOKUP_STEP)).strftime("%d-%b-%Y")
+        # Future price
+        fut_reg = final_reg.predict(X_te[-1:])
+        fut_clf = final_clf.predict_proba(X_te[-1:])[:, 1]
+        fut_adj = fut_reg * (1 + 0.1 * (2 * (fut_clf > 0.5).astype(int) - 1))
+        fp = float(inverse_transform(fut_adj, cidx, scaler)[0])
+        fd = (dates[-1] + BDay(LOOKUP_STEP)).strftime("%d-%b-%Y")
 
         jobs[job_id]["status"] = "done"
         jobs[job_id]["result"] = {
@@ -250,7 +313,9 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+    active_keys = len(TD_KEYS)
+    return {"status": "ok", "api_keys_loaded": active_keys,
+            "timestamp": datetime.utcnow().isoformat()}
 
 class PredictReq(BaseModel):
     ticker:        str
