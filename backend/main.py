@@ -8,19 +8,19 @@ from pydantic import BaseModel
 import yfinance as yf
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.layers import Bidirectional
+from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error
 from pandas.tseries.offsets import BDay
 
 warnings.filterwarnings("ignore")
 
-N_STEPS, LOOKUP_STEP, TEST_SIZE = 10, 1, 0.1
-BATCH_SIZE, EPOCHS, PATIENCE    = 32, 30, 5
-LEARNING_RATE, N_FOLDS          = 0.0001, 3
-THRESHOLD                       = 0.005
+N_STEPS     = 10
+LOOKUP_STEP = 1
+TEST_SIZE   = 0.1
+N_FOLDS     = 3
+THRESHOLD   = 0.005
 
 app = FastAPI(title="Stock Predictor API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
@@ -42,19 +42,19 @@ def compute_macd(series, fast=12, slow=26, signal=9):
     return macd, macd.ewm(span=signal, adjust=False).mean()
 
 def compute_atr(high, low, close, period=14):
-    tr = pd.concat([high-low,
-                    (high-close.shift()).abs(),
-                    (low-close.shift()).abs()], axis=1).max(axis=1)
+    tr = pd.concat([high - low,
+                    (high - close.shift()).abs(),
+                    (low  - close.shift()).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1/period, min_periods=period).mean()
 
 def compute_adx(high, low, close, period=14):
-    atr      = compute_atr(high, low, close, period)
-    up, dn   = high - high.shift(), low.shift() - low
-    dmp      = up.where((up > dn) & (up > 0), 0.0)
-    dmm      = dn.where((dn > up) & (dn > 0), 0.0)
-    dip      = 100 * dmp.ewm(alpha=1/period, min_periods=period).mean() / atr.replace(0, np.nan)
-    dim      = 100 * dmm.ewm(alpha=1/period, min_periods=period).mean() / atr.replace(0, np.nan)
-    dx       = ((dip - dim).abs() / (dip + dim).replace(0, np.nan)) * 100
+    atr = compute_atr(high, low, close, period)
+    up, dn = high - high.shift(), low.shift() - low
+    dmp = up.where((up > dn) & (up > 0), 0.0)
+    dmm = dn.where((dn > up) & (dn > 0), 0.0)
+    dip = 100 * dmp.ewm(alpha=1/period, min_periods=period).mean() / atr.replace(0, np.nan)
+    dim = 100 * dmm.ewm(alpha=1/period, min_periods=period).mean() / atr.replace(0, np.nan)
+    dx  = ((dip - dim).abs() / (dip + dim).replace(0, np.nan)) * 100
     return dx.ewm(alpha=1/period, min_periods=period).mean().fillna(0)
 
 def add_indicators(df):
@@ -96,13 +96,19 @@ def feature_selection(df):
                 "Volatility_20","RSI","OBV","Lag_Close_2","Lag_Volume_2"]
     return list(set(selected + must))
 
+def make_flat_features(scaled, n_steps, close_idx):
+    """Flatten sliding windows into 2D for sklearn models."""
+    X, yr = [], []
+    for i in range(n_steps, len(scaled) - LOOKUP_STEP + 1):
+        X.append(scaled[i - n_steps:i].flatten())
+        yr.append(scaled[i + LOOKUP_STEP - 1][close_idx])
+    return np.array(X), np.array(yr)
+
 def inverse_transform(preds, col_idx, scaler):
     return np.array(preds).flatten() * scaler.scale_[col_idx] + scaler.mean_[col_idx]
 
 def load_data(ticker):
-    """Download 5y daily OHLCV via yfinance (works on Render IPs)."""
     ticker = ticker.upper().strip()
-    # Ensure .NS suffix for NSE stocks
     if not ticker.endswith(".NS") and not ticker.endswith(".BO"):
         ticker = ticker + ".NS"
 
@@ -111,7 +117,7 @@ def load_data(ticker):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
     if df.empty:
-        raise ValueError(f"No data returned for {ticker}. Check the symbol is valid.")
+        raise ValueError(f"No data returned for {ticker}. Check the symbol.")
 
     df = df[["Open","High","Low","Close","Volume"]]
     df = df[df["Close"].between(df["Close"].quantile(0.005),
@@ -127,107 +133,102 @@ def load_data(ticker):
 
     df_feat  = df[fcols].dropna()
     df_label = df.loc[df_feat.index, "Price_Direction"]
-    scaler   = StandardScaler()
-    scaled   = scaler.fit_transform(df_feat.values)
-    cidx     = fcols.index("Close")
 
-    X, yr, yc = [], [], []
-    lab = df_label.values
-    for i in range(N_STEPS, len(scaled) - LOOKUP_STEP + 1):
-        X.append(scaled[i-N_STEPS:i])
-        yr.append(scaled[i+LOOKUP_STEP-1][cidx])
-        yc.append(lab[i+LOOKUP_STEP-1])
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(df_feat.values)
+    cidx   = fcols.index("Close")
 
-    X, yr, yc = np.array(X), np.array(yr), np.array(yc)
-    n = max(1, int(TEST_SIZE * len(X)))
-    return X[:-n], X[-n:], yr[:-n], yr[-n:], yc[:-n], yc[-n:], \
-           scaler, df.index[-len(yr):], df, cidx
+    X_flat, yr = make_flat_features(scaled, N_STEPS, cidx)
+    yc = df_label.values[N_STEPS: N_STEPS + len(yr)]
 
-def custom_loss(y_true, y_pred):
-    mse   = tf.reduce_mean(tf.square(y_true - y_pred))
-    dt    = tf.sign(y_true[1:] - y_true[:-1])
-    dp    = tf.sign(y_pred[1:] - y_pred[:-1])
-    dloss = tf.reduce_mean(tf.cast(tf.not_equal(dt, dp), tf.float32))
-    return mse + 1.5 * dloss
+    n = max(1, int(TEST_SIZE * len(X_flat)))
+    dates = df.index[N_STEPS: N_STEPS + len(yr)]
 
-def build_model(mtype, shape, bidir=False, classify=False):
-    inp = keras.Input(shape=shape)
-    if mtype == "GRU":    base = layers.GRU(64, return_sequences=True)
-    elif mtype == "LSTM": base = layers.LSTM(64, return_sequences=True)
-    elif mtype == "Conv1D": base = layers.Conv1D(64, 3, activation="relu", padding="same")
-    else:                 base = layers.TimeDistributed(layers.Dense(64, activation="relu"))
-    x = Bidirectional(base)(inp) if (bidir and mtype in ["GRU","LSTM"]) else base(inp)
-    if mtype != "Conv1D":
-        x = layers.Conv1D(32, 3, activation="relu", padding="same")(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.MultiHeadAttention(num_heads=4, key_dim=8)(x, x)
-    x = layers.GlobalAveragePooling1D()(x)
-    x = layers.Dropout(0.3)(x)
-    x = layers.Dense(32, activation="relu",
-                     kernel_regularizer=keras.regularizers.l2(0.01))(x)
-    out = layers.Dense(1, activation="sigmoid" if classify else None)(x)
-    m   = keras.Model(inp, out)
-    m.compile(optimizer=keras.optimizers.Adam(LEARNING_RATE),
-              loss="binary_crossentropy" if classify else custom_loss,
-              metrics=["accuracy"] if classify else [])
-    return m
+    return (X_flat[:-n], X_flat[-n:],
+            yr[:-n],     yr[-n:],
+            yc[:-n],     yc[-n:],
+            scaler, dates, df, cidx)
 
 def run_job(job_id, ticker, mtype, bidir):
     try:
         jobs[job_id]["status"] = "loading_data"
         X_tr, X_te, yr_tr, yr_te, yc_tr, yc_te, scaler, dates, df, cidx = load_data(ticker)
 
-        cb = [EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True),
-              ReduceLROnPlateau(monitor="val_loss", factor=0.3, patience=2, min_lr=1e-6)]
-        tscv     = TimeSeriesSplit(n_splits=N_FOLDS)
-        reg_ms, clf_ms = [], []
+        tscv = TimeSeriesSplit(n_splits=N_FOLDS)
+        reg_preds_list = []
+        clf_preds_list = []
 
         for fold, (ti, vi) in enumerate(tscv.split(X_tr)):
             jobs[job_id]["status"] = f"training_fold_{fold+1}_of_{N_FOLDS}"
-            rm = build_model(mtype, X_tr.shape[1:], bidir, classify=False)
-            rm.fit(X_tr[ti], yr_tr[ti], validation_data=(X_tr[vi], yr_tr[vi]),
-                   epochs=EPOCHS, batch_size=BATCH_SIZE, callbacks=cb, verbose=0)
-            reg_ms.append(rm)
-            cm = build_model(mtype, X_tr.shape[1:], bidir, classify=True)
-            cm.fit(X_tr[ti], yc_tr[ti], validation_data=(X_tr[vi], yc_tr[vi]),
-                   epochs=EPOCHS, batch_size=BATCH_SIZE, callbacks=cb, verbose=0)
-            clf_ms.append(cm)
+
+            # Regression model
+            if mtype == "GRU" or mtype == "LSTM":
+                reg = GradientBoostingRegressor(n_estimators=200, max_depth=4,
+                                                learning_rate=0.05, random_state=42)
+            elif mtype == "Conv1D":
+                reg = RandomForestRegressor(n_estimators=200, max_depth=8,
+                                            random_state=42, n_jobs=-1)
+            else:
+                reg = Ridge(alpha=1.0)
+
+            reg.fit(X_tr[ti], yr_tr[ti])
+            reg_preds_list.append(reg.predict(X_te))
+
+            # Classification model
+            if mtype in ["GRU", "LSTM"]:
+                clf = GradientBoostingClassifier(n_estimators=200, max_depth=4,
+                                                 learning_rate=0.05, random_state=42)
+            elif mtype == "Conv1D":
+                clf = RandomForestClassifier(n_estimators=200, max_depth=8,
+                                             random_state=42, n_jobs=-1)
+            else:
+                from sklearn.linear_model import LogisticRegression
+                clf = LogisticRegression(C=1.0, max_iter=500)
+
+            clf.fit(X_tr[ti], yc_tr[ti])
+            clf_preds_list.append(clf.predict_proba(X_te)[:, 1])
 
         jobs[job_id]["status"] = "predicting"
-        w   = np.ones(len(reg_ms)) / len(reg_ms)
-        yrp = np.sum([w[i]*reg_ms[i].predict(X_te, verbose=0)
-                      for i in range(len(reg_ms))], axis=0)
-        ycp = np.mean([m.predict(X_te, verbose=0) for m in clf_ms], axis=0)
-        adj = yrp * (1 + 0.1 * (2*(ycp > 0.5).astype(int) - 1))
 
-        ya  = inverse_transform(adj, cidx, scaler)
-        yt  = inverse_transform(yr_te.reshape(-1,1), cidx, scaler)
-        nz  = yt != 0
-        mape= float(np.mean(np.abs((yt[nz]-ya[nz])/yt[nz]))*100) if nz.any() else 0
-        rmse= float(np.sqrt(np.mean((yt-ya)**2)))
-        da  = float(np.mean(np.sign(yt[1:]-yt[:-1]) == np.sign(ya[1:]-ya[:-1]))*100)
+        # Ensemble average across folds
+        yrp = np.mean(reg_preds_list, axis=0)
+        ycp = np.mean(clf_preds_list, axis=0)
+        direction = (ycp > 0.5).astype(int)
+        adj = yrp * (1 + 0.1 * (2 * direction - 1))
 
-        frp = np.sum([w[i]*reg_ms[i].predict(X_te[-1:], verbose=0)
-                      for i in range(len(reg_ms))], axis=0)
-        fcp = np.mean([m.predict(X_te[-1:], verbose=0) for m in clf_ms], axis=0)
-        fad = frp * (1 + 0.1 * (2*(fcp > 0.5).astype(int) - 1))
-        fp  = float(inverse_transform(fad, cidx, scaler)[0])
+        ya = inverse_transform(adj, cidx, scaler)
+        yt = inverse_transform(yr_te, cidx, scaler)
+
+        nz   = yt != 0
+        mape = float(np.mean(np.abs((yt[nz] - ya[nz]) / yt[nz])) * 100) if nz.any() else 0
+        rmse = float(np.sqrt(np.mean((yt - ya) ** 2)))
+        da   = float(np.mean(np.sign(yt[1:] - yt[:-1]) == np.sign(ya[1:] - ya[:-1])) * 100)
+
+        # Future prediction
+        fut_reg = np.mean([reg.predict(X_te[-1:]) for reg in
+                           [GradientBoostingRegressor(n_estimators=200, max_depth=4,
+                            learning_rate=0.05, random_state=42).fit(X_tr, yr_tr)]], axis=0)
+        fut_clf_prob = GradientBoostingClassifier(n_estimators=200, max_depth=4,
+                       learning_rate=0.05, random_state=42).fit(X_tr, yc_tr).predict_proba(X_te[-1:])[:, 1]
+        fut_dir = (fut_clf_prob > 0.5).astype(int)
+        fut_adj = fut_reg * (1 + 0.1 * (2 * fut_dir - 1))
+        fp  = float(inverse_transform(fut_adj, cidx, scaler)[0])
         fd  = (dates[-1] + BDay(LOOKUP_STEP)).strftime("%d-%b-%Y")
 
         jobs[job_id]["status"] = "done"
         jobs[job_id]["result"] = {
-            "ticker":       ticker,
-            "model_type":   mtype,
+            "ticker":        ticker,
+            "model_type":    mtype,
             "bidirectional": bidir,
-            "future_price": round(fp, 2),
-            "future_date":  fd,
+            "future_price":  round(fp, 2),
+            "future_date":   fd,
             "current_price": round(float(yt[-1]), 2),
-            "mape":  round(mape, 2),
-            "rmse":  round(rmse, 2),
+            "mape":          round(mape, 2),
+            "rmse":          round(rmse, 2),
             "directional_accuracy": round(da, 2),
-            "chart_dates":  [str(d.date()) for d in dates[-len(yt):]],
-            "chart_actual": [round(float(v), 2) for v in yt],
-            "chart_pred":   [round(float(v), 2) for v in ya],
+            "chart_dates":   [str(d.date()) for d in dates[-len(yt):]],
+            "chart_actual":  [round(float(v), 2) for v in yt],
+            "chart_pred":    [round(float(v), 2) for v in ya],
             "ohlcv": [
                 {"date":   str(idx.date()),
                  "open":   round(float(r["Open"]),  2),
@@ -245,15 +246,15 @@ def run_job(job_id, ticker, mtype, bidir):
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"message": "Stock Predictor API is running. Visit /docs for API reference."}
+    return {"message": "Stock Predictor API running. Visit /docs for reference."}
 
 @app.get("/health")
 def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 class PredictReq(BaseModel):
-    ticker:       str
-    model_type:   str  = "GRU"
+    ticker:        str
+    model_type:    str  = "GRU"
     bidirectional: bool = False
 
 @app.post("/predict")
