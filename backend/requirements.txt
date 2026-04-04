@@ -4,5 +4,5 @@ pydantic==2.7.1
 numpy==1.26.4
 pandas==2.2.2
 scikit-learn==1.5.0
-yfinance==0.2.40
+requests==2.31.0
 ta==0.11.0
