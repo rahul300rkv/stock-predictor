@@ -59,20 +59,29 @@ def fetch_ohlcv(symbol: str) -> pd.DataFrame:
     for attempt in range(attempts):
         key = TD_KEYS[_key_index % len(TD_KEYS)] if TD_KEYS else ""
         try:
-            resp = requests.get(
-                "https://api.twelvedata.com/time_series",
-                params={
-                    "symbol":     clean,
-                    "exchange":   "NSE",
-                    "interval":   "1day",
-                    "outputsize": 1260,      # ~5 years trading days
-                    "apikey":     key,
-                    "format":     "JSON",
-                    "order":      "ASC",
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
+            # Try NSE first, fall back to BSE (free tier supports BSE)
+            resp = None
+            for exchange in ["NSE", "BSE"]:
+                resp = requests.get(
+                    "https://api.twelvedata.com/time_series",
+                    params={
+                        "symbol":     clean,
+                        "exchange":   exchange,
+                        "interval":   "1day",
+                        "outputsize": 1260,
+                        "apikey":     key,
+                        "format":     "JSON",
+                        "order":      "ASC",
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                # If NSE is paywalled, try BSE
+                if data.get("status") == "error" and "plan" in str(data.get("message","")).lower():
+                    print(f"{exchange} requires paid plan, trying next exchange...")
+                    continue
+                break  # worked
             data = resp.json()
 
             # Rate limit hit → rotate key and retry
