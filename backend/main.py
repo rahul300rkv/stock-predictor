@@ -61,6 +61,7 @@ def fetch_eodhd(symbol: str) -> pd.DataFrame:
     """
     errors = []
     keys_to_try = list(EODHD_KEYS) if EODHD_KEYS else []
+    print(f"[EODHD] keys available: {len(keys_to_try)}, symbol: {symbol}")
 
     for key in keys_to_try:
         try:
@@ -77,6 +78,7 @@ def fetch_eodhd(symbol: str) -> pd.DataFrame:
                     }, timeout=30)
                     resp.raise_for_status()
                     data = resp.json()
+                    print(f"[EODHD] {symbol}.{suffix} status={resp.status_code} type={type(data).__name__} len={len(data) if isinstance(data, list) else 'dict'} preview={str(data)[:200]}")
 
                     if isinstance(data, dict) and data.get("message"):
                         msg = data["message"]
@@ -219,7 +221,7 @@ def fetch_ohlcv(symbol: str) -> pd.DataFrame:
 
     raise ValueError(
         f"All data sources failed for '{clean}'. "
-        f"Check your API keys in Render environment variables. "
+        f"EODHD keys loaded: {len(EODHD_KEYS)}, AV keys loaded: {len(AV_KEYS)}. "
         f"Last error: {last_error}"
     )
 
