@@ -64,44 +64,54 @@ def fetch_eodhd(symbol: str) -> pd.DataFrame:
 
     for key in keys_to_try:
         try:
-            url = f"https://eodhd.com/api/eod/{symbol}.NSE"
-            resp = requests.get(url, params={
-                "api_token": key,
-                "fmt":       "json",
-                "from":      "2019-01-01",
-                "period":    "d",
-            }, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
+            # Try NSE first, then BSE
+            df_result = None
+            for suffix in ["NSE", "BSE"]:
+                url = f"https://eodhd.com/api/eod/{symbol}.{suffix}"
+                try:
+                    resp = requests.get(url, params={
+                        "api_token": key,
+                        "fmt":       "json",
+                        "from":      "2019-01-01",
+                        "period":    "d",
+                    }, timeout=30)
+                    resp.raise_for_status()
+                    data = resp.json()
 
-            if isinstance(data, dict) and data.get("message"):
-                msg = data["message"]
-                if "limit" in msg.lower() or "exceeded" in msg.lower():
-                    errors.append(f"EODHD key exhausted: {msg}")
-                    next_eodhd_key()
+                    if isinstance(data, dict) and data.get("message"):
+                        msg = data["message"]
+                        if "limit" in msg.lower() or "exceeded" in msg.lower():
+                            errors.append(f"EODHD key exhausted: {msg}")
+                            next_eodhd_key()
+                            break  # try next key
+                        errors.append(f"EODHD {suffix} error: {msg}")
+                        continue  # try BSE
+
+                    if not isinstance(data, list) or len(data) == 0:
+                        errors.append(f"EODHD: no data for {symbol}.{suffix}")
+                        continue  # try BSE
+
+                    df = pd.DataFrame(data)
+                    df["date"] = pd.to_datetime(df["date"])
+                    df = df.set_index("date").sort_index()
+                    df = df.rename(columns={
+                        "open": "Open", "high": "High",
+                        "low":  "Low",  "close": "Close",
+                        "volume": "Volume"
+                    })
+                    for col in ["Open","High","Low","Close","Volume"]:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                    df = df[["Open","High","Low","Close","Volume"]].dropna()
+
+                    if df.empty:
+                        errors.append(f"EODHD: empty dataframe for {symbol}.{suffix}")
+                        continue  # try BSE
+
+                    print(f"EODHD success: {len(df)} rows for {symbol}.{suffix}")
+                    return df
+                except requests.exceptions.RequestException as req_err:
+                    errors.append(f"EODHD {suffix} request error: {req_err}")
                     continue
-                raise ValueError(f"EODHD error: {msg}")
-
-            if not isinstance(data, list) or len(data) == 0:
-                raise ValueError(f"EODHD: no data for {symbol}.NSE")
-
-            df = pd.DataFrame(data)
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.set_index("date").sort_index()
-            df = df.rename(columns={
-                "open": "Open", "high": "High",
-                "low":  "Low",  "close": "Close",
-                "volume": "Volume"
-            })
-            for col in ["Open","High","Low","Close","Volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df = df[["Open","High","Low","Close","Volume"]].dropna()
-
-            if df.empty:
-                raise ValueError(f"EODHD: empty dataframe for {symbol}")
-
-            print(f"EODHD success: {len(df)} rows for {symbol}")
-            return df
 
         except ValueError:
             raise
@@ -121,6 +131,8 @@ def fetch_alpha_vantage(symbol: str) -> pd.DataFrame:
     errors = []
     keys_to_try = list(AV_KEYS) if AV_KEYS else []
 
+    # Note: AV free tier only returns last 100 days with compact
+    # This is a fallback - EODHD is preferred for full history
     for key in keys_to_try:
         try:
             resp = requests.get(
@@ -129,7 +141,7 @@ def fetch_alpha_vantage(symbol: str) -> pd.DataFrame:
                     "function":   "TIME_SERIES_DAILY",
                     "symbol":     f"{symbol}.BSE",
                     "apikey":     key,
-                    "outputsize": "full",
+                    "outputsize": "compact",   # free tier max
                     "datatype":   "json",
                 },
                 timeout=30,
@@ -291,6 +303,9 @@ def inverse_transform(preds, col_idx, scaler):
 
 def load_data(ticker):
     df = fetch_ohlcv(ticker)
+    # Need at least 60 rows after indicators for training
+    if len(df) < 60:
+        raise ValueError(f"Insufficient data: only {len(df)} rows for {ticker}. EODHD may have failed and AV compact only returns 100 days.")
     df = df[df["Close"].between(df["Close"].quantile(0.005),
                                 df["Close"].quantile(0.995))]
     df = add_indicators(df)
