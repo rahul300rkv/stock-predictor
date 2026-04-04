@@ -1,7 +1,7 @@
 import os, warnings, uuid, requests
 import numpy as np
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -26,103 +26,190 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
 
 jobs: dict = {}
 
-# ── Twelve Data key rotation ──────────────────────────────────────────────────
-# Add as many keys as you have accounts - they rotate automatically
-TD_KEYS = [k.strip() for k in [
-    os.environ.get("TWELVEDATA_API_KEY_1", ""),
-    os.environ.get("TWELVEDATA_API_KEY_2", ""),
-    os.environ.get("TWELVEDATA_API_KEY_3", ""),  # add more if needed
+# ── API Key pools ─────────────────────────────────────────────────────────────
+# Add as many keys as you have — they rotate automatically when one hits limit
+AV_KEYS = [k.strip() for k in [          # Alpha Vantage keys
+    os.environ.get("AV_API_KEY_1", ""),
+    os.environ.get("AV_API_KEY_2", ""),
+    os.environ.get("AV_API_KEY_3", ""),
 ] if k.strip()]
 
-_key_index = 0  # current active key
+EODHD_KEYS = [k.strip() for k in [       # EODHD keys
+    os.environ.get("EODHD_API_KEY_1", ""),
+    os.environ.get("EODHD_API_KEY_2", ""),
+    os.environ.get("EODHD_API_KEY_3", ""),
+] if k.strip()]
 
-def get_next_key():
-    """Rotate to next available key."""
-    global _key_index
-    if not TD_KEYS:
-        raise ValueError("No Twelve Data API keys set. Add TWELVEDATA_API_KEY_1 and TWELVEDATA_API_KEY_2 in Render environment variables.")
-    _key_index = (_key_index + 1) % len(TD_KEYS)
-    return TD_KEYS[_key_index]
+_av_idx    = 0
+_eodhd_idx = 0
 
-def fetch_ohlcv(symbol: str) -> pd.DataFrame:
+def next_av_key():
+    global _av_idx
+    _av_idx = (_av_idx + 1) % max(len(AV_KEYS), 1)
+    return AV_KEYS[_av_idx] if AV_KEYS else ""
+
+def next_eodhd_key():
+    global _eodhd_idx
+    _eodhd_idx = (_eodhd_idx + 1) % max(len(EODHD_KEYS), 1)
+    return EODHD_KEYS[_eodhd_idx] if EODHD_KEYS else ""
+
+# ── EODHD fetcher ─────────────────────────────────────────────────────────────
+def fetch_eodhd(symbol: str) -> pd.DataFrame:
     """
-    Fetch 5 years of daily OHLCV from Twelve Data.
-    Automatically rotates API keys if one hits rate limit.
-    symbol: NSE symbol e.g. 'RELIANCE.NS' or 'RELIANCE'
+    Fetch from EODHD. Free tier: 20 calls/day per key.
+    symbol format: RELIANCE (bare), appends .NSE automatically
     """
-    clean = symbol.upper().replace(".NS", "").replace(".BO", "").replace(".BSE", "")
+    errors = []
+    keys_to_try = list(EODHD_KEYS) if EODHD_KEYS else []
 
-    last_error = None
-    # Try each key up to 2 full rotations
-    attempts = len(TD_KEYS) * 2 if TD_KEYS else 1
-
-    for attempt in range(attempts):
-        key = TD_KEYS[_key_index % len(TD_KEYS)] if TD_KEYS else ""
+    for key in keys_to_try:
         try:
-            # Try NSE first, fall back to BSE (free tier supports BSE)
-            resp = None
-            for exchange in ["NSE", "BSE"]:
-                resp = requests.get(
-                    "https://api.twelvedata.com/time_series",
-                    params={
-                        "symbol":     clean,
-                        "exchange":   exchange,
-                        "interval":   "1day",
-                        "outputsize": 1260,
-                        "apikey":     key,
-                        "format":     "JSON",
-                        "order":      "ASC",
-                    },
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                # If NSE is paywalled, try BSE
-                if data.get("status") == "error" and "plan" in str(data.get("message","")).lower():
-                    print(f"{exchange} requires paid plan, trying next exchange...")
-                    continue
-                break  # worked
+            url = f"https://eodhd.com/api/eod/{symbol}.NSE"
+            resp = requests.get(url, params={
+                "api_token": key,
+                "fmt":       "json",
+                "from":      "2019-01-01",
+                "period":    "d",
+            }, timeout=30)
+            resp.raise_for_status()
             data = resp.json()
 
-            # Rate limit hit → rotate key and retry
-            if data.get("code") in [429, 400] or "rate limit" in str(data.get("message","")).lower():
-                print(f"Key {_key_index} rate limited, rotating...")
-                get_next_key()
-                last_error = data.get("message", "Rate limit")
-                continue
+            if isinstance(data, dict) and data.get("message"):
+                msg = data["message"]
+                if "limit" in msg.lower() or "exceeded" in msg.lower():
+                    errors.append(f"EODHD key exhausted: {msg}")
+                    next_eodhd_key()
+                    continue
+                raise ValueError(f"EODHD error: {msg}")
 
-            if data.get("status") == "error":
-                raise ValueError(f"Twelve Data error: {data.get('message', 'Unknown')}")
+            if not isinstance(data, list) or len(data) == 0:
+                raise ValueError(f"EODHD: no data for {symbol}.NSE")
 
-            values = data.get("values")
-            if not values:
-                raise ValueError(f"No data returned for {clean} on NSE.")
-
-            df = pd.DataFrame(values)
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            df = df.set_index("datetime").sort_index()
+            df = pd.DataFrame(data)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date").sort_index()
             df = df.rename(columns={
                 "open": "Open", "high": "High",
-                "low":  "Low",  "close": "Close", "volume": "Volume"
+                "low":  "Low",  "close": "Close",
+                "volume": "Volume"
             })
-            for col in ["Open", "High", "Low", "Close", "Volume"]:
+            for col in ["Open","High","Low","Close","Volume"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+            df = df[["Open","High","Low","Close","Volume"]].dropna()
 
             if df.empty:
-                raise ValueError(f"Empty data for {clean}")
+                raise ValueError(f"EODHD: empty dataframe for {symbol}")
 
-            print(f"Fetched {len(df)} rows for {clean} using key index {_key_index}")
+            print(f"EODHD success: {len(df)} rows for {symbol}")
             return df
 
         except ValueError:
             raise
         except Exception as e:
-            last_error = str(e)
-            get_next_key()
+            errors.append(f"EODHD: {e}")
+            next_eodhd_key()
             continue
 
-    raise ValueError(f"All Twelve Data keys failed. Last error: {last_error}")
+    raise ValueError(f"EODHD failed for {symbol}. Errors: {'; '.join(errors)}")
+
+# ── Alpha Vantage fetcher ─────────────────────────────────────────────────────
+def fetch_alpha_vantage(symbol: str) -> pd.DataFrame:
+    """
+    Fetch from Alpha Vantage. Free tier: 25 calls/day per key.
+    symbol format: RELIANCE.BSE
+    """
+    errors = []
+    keys_to_try = list(AV_KEYS) if AV_KEYS else []
+
+    for key in keys_to_try:
+        try:
+            resp = requests.get(
+                "https://www.alphavantage.co/query",
+                params={
+                    "function":   "TIME_SERIES_DAILY",
+                    "symbol":     f"{symbol}.BSE",
+                    "apikey":     key,
+                    "outputsize": "full",
+                    "datatype":   "json",
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Rate limit or error checks
+            if "Note" in data or "Information" in data:
+                msg = data.get("Note") or data.get("Information", "")
+                errors.append(f"AV key exhausted: {msg}")
+                next_av_key()
+                continue
+
+            if "Error Message" in data:
+                raise ValueError(f"Alpha Vantage error: {data['Error Message']}")
+
+            ts = data.get("Time Series (Daily)", {})
+            if not ts:
+                raise ValueError(f"Alpha Vantage: no time series data for {symbol}.BSE")
+
+            rows = []
+            for date_str, vals in ts.items():
+                rows.append({
+                    "date":   pd.to_datetime(date_str),
+                    "Open":   float(vals["1. open"]),
+                    "High":   float(vals["2. high"]),
+                    "Low":    float(vals["3. low"]),
+                    "Close":  float(vals["4. close"]),
+                    "Volume": float(vals["5. volume"]),
+                })
+            df = pd.DataFrame(rows).set_index("date").sort_index()
+            df = df[["Open","High","Low","Close","Volume"]].dropna()
+
+            if df.empty:
+                raise ValueError(f"Alpha Vantage: empty data for {symbol}")
+
+            print(f"Alpha Vantage success: {len(df)} rows for {symbol}")
+            return df
+
+        except ValueError:
+            raise
+        except Exception as e:
+            errors.append(f"AV: {e}")
+            next_av_key()
+            continue
+
+    raise ValueError(f"Alpha Vantage failed for {symbol}. Errors: {'; '.join(errors)}")
+
+# ── Master fetcher with fallback chain ───────────────────────────────────────
+def fetch_ohlcv(symbol: str) -> pd.DataFrame:
+    """
+    Try EODHD first, fall back to Alpha Vantage.
+    Both rotate through all available keys before giving up.
+    """
+    clean = symbol.upper().strip().replace(".NS","").replace(".BO","").replace(".BSE","")
+
+    last_error = ""
+
+    # 1. Try EODHD (20 calls/day/key, NSE data)
+    if EODHD_KEYS:
+        try:
+            return fetch_eodhd(clean)
+        except Exception as e:
+            last_error = str(e)
+            print(f"EODHD failed, trying Alpha Vantage... ({e})")
+
+    # 2. Try Alpha Vantage (25 calls/day/key, BSE data)
+    if AV_KEYS:
+        try:
+            return fetch_alpha_vantage(clean)
+        except Exception as e:
+            last_error = str(e)
+            print(f"Alpha Vantage also failed: {e}")
+
+    raise ValueError(
+        f"All data sources failed for '{clean}'. "
+        f"Check your API keys in Render environment variables. "
+        f"Last error: {last_error}"
+    )
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 def compute_rsi(series, period=14):
@@ -203,30 +290,23 @@ def inverse_transform(preds, col_idx, scaler):
     return np.array(preds).flatten() * scaler.scale_[col_idx] + scaler.mean_[col_idx]
 
 def load_data(ticker):
-    ticker = ticker.upper().strip()
     df = fetch_ohlcv(ticker)
     df = df[df["Close"].between(df["Close"].quantile(0.005),
                                 df["Close"].quantile(0.995))]
     df = add_indicators(df)
-
     future = df["Close"].shift(-LOOKUP_STEP)
     df["Price_Direction"] = ((future - df["Close"]) / df["Close"] > THRESHOLD).astype(int)
-
     fcols = feature_selection(df)
     if "Price_Direction" in fcols:
         fcols.remove("Price_Direction")
-
     df_feat  = df[fcols].dropna()
     df_label = df.loc[df_feat.index, "Price_Direction"]
-
-    scaler = StandardScaler()
-    scaled = scaler.fit_transform(df_feat.values)
-    cidx   = fcols.index("Close")
-
+    scaler   = StandardScaler()
+    scaled   = scaler.fit_transform(df_feat.values)
+    cidx     = fcols.index("Close")
     X_flat, yr = make_flat_features(scaled, N_STEPS, cidx)
     yc    = df_label.values[N_STEPS: N_STEPS + len(yr)]
     dates = df_feat.index[N_STEPS: N_STEPS + len(yr)]
-
     n = max(1, int(TEST_SIZE * len(X_flat)))
     return (X_flat[:-n], X_flat[-n:],
             yr[:-n],     yr[-n:],
@@ -235,25 +315,22 @@ def load_data(ticker):
 
 def get_models(mtype):
     if mtype in ["GRU", "LSTM"]:
-        reg = GradientBoostingRegressor(n_estimators=200, max_depth=4,
-                                        learning_rate=0.05, random_state=42)
-        clf = GradientBoostingClassifier(n_estimators=200, max_depth=4,
-                                         learning_rate=0.05, random_state=42)
+        return (GradientBoostingRegressor(n_estimators=200, max_depth=4,
+                                          learning_rate=0.05, random_state=42),
+                GradientBoostingClassifier(n_estimators=200, max_depth=4,
+                                           learning_rate=0.05, random_state=42))
     elif mtype == "Conv1D":
-        reg = RandomForestRegressor(n_estimators=200, max_depth=8,
-                                    random_state=42, n_jobs=-1)
-        clf = RandomForestClassifier(n_estimators=200, max_depth=8,
-                                     random_state=42, n_jobs=-1)
+        return (RandomForestRegressor(n_estimators=200, max_depth=8,
+                                      random_state=42, n_jobs=-1),
+                RandomForestClassifier(n_estimators=200, max_depth=8,
+                                       random_state=42, n_jobs=-1))
     else:
-        reg = Ridge(alpha=1.0)
-        clf = LogisticRegression(C=1.0, max_iter=500)
-    return reg, clf
+        return Ridge(alpha=1.0), LogisticRegression(C=1.0, max_iter=500)
 
 def run_job(job_id, ticker, mtype, bidir):
     try:
         jobs[job_id]["status"] = "loading_data"
         X_tr, X_te, yr_tr, yr_te, yc_tr, yc_te, scaler, dates, df, cidx = load_data(ticker)
-
         tscv = TimeSeriesSplit(n_splits=N_FOLDS)
         reg_preds, clf_preds = [], []
         final_reg = final_clf = None
@@ -265,27 +342,25 @@ def run_job(job_id, ticker, mtype, bidir):
             clf.fit(X_tr[ti], yc_tr[ti])
             reg_preds.append(reg.predict(X_te))
             clf_preds.append(clf.predict_proba(X_te)[:, 1])
-            final_reg, final_clf = reg, clf  # keep last fold for future pred
+            final_reg, final_clf = reg, clf
 
         jobs[job_id]["status"] = "predicting"
         yrp = np.mean(reg_preds, axis=0)
         ycp = np.mean(clf_preds, axis=0)
         adj = yrp * (1 + 0.1 * (2 * (ycp > 0.5).astype(int) - 1))
-
-        ya = inverse_transform(adj, cidx, scaler)
-        yt = inverse_transform(yr_te, cidx, scaler)
+        ya  = inverse_transform(adj, cidx, scaler)
+        yt  = inverse_transform(yr_te, cidx, scaler)
 
         nz   = yt != 0
-        mape = float(np.mean(np.abs((yt[nz] - ya[nz]) / yt[nz])) * 100) if nz.any() else 0
-        rmse = float(np.sqrt(np.mean((yt - ya) ** 2)))
-        da   = float(np.mean(np.sign(yt[1:] - yt[:-1]) == np.sign(ya[1:] - ya[:-1])) * 100)
+        mape = float(np.mean(np.abs((yt[nz]-ya[nz])/yt[nz]))*100) if nz.any() else 0
+        rmse = float(np.sqrt(np.mean((yt-ya)**2)))
+        da   = float(np.mean(np.sign(yt[1:]-yt[:-1])==np.sign(ya[1:]-ya[:-1]))*100)
 
-        # Future price
         fut_reg = final_reg.predict(X_te[-1:])
         fut_clf = final_clf.predict_proba(X_te[-1:])[:, 1]
-        fut_adj = fut_reg * (1 + 0.1 * (2 * (fut_clf > 0.5).astype(int) - 1))
-        fp = float(inverse_transform(fut_adj, cidx, scaler)[0])
-        fd = (dates[-1] + BDay(LOOKUP_STEP)).strftime("%d-%b-%Y")
+        fut_adj = fut_reg * (1 + 0.1 * (2*(fut_clf > 0.5).astype(int) - 1))
+        fp  = float(inverse_transform(fut_adj, cidx, scaler)[0])
+        fd  = (dates[-1] + BDay(LOOKUP_STEP)).strftime("%d-%b-%Y")
 
         jobs[job_id]["status"] = "done"
         jobs[job_id]["result"] = {
@@ -322,9 +397,12 @@ def root():
 
 @app.get("/health")
 def health():
-    active_keys = len(TD_KEYS)
-    return {"status": "ok", "api_keys_loaded": active_keys,
-            "timestamp": datetime.utcnow().isoformat()}
+    return {
+        "status":            "ok",
+        "eodhd_keys_loaded": len(EODHD_KEYS),
+        "av_keys_loaded":    len(AV_KEYS),
+        "timestamp":         datetime.utcnow().isoformat()
+    }
 
 class PredictReq(BaseModel):
     ticker:        str
@@ -353,10 +431,9 @@ def load_symbols_from_csv(path: str = "nifty.csv") -> list:
     try:
         df = pd.read_csv(path)
         syms = df.iloc[:, 0].dropna().str.strip().tolist()
-        return [{"label": s.replace(".NS","").replace(".BO",""), "value": s}
-                for s in syms if s and s != "Symbol"]
+        return [{"label": s, "value": s} for s in syms if s and s != "Symbol"]
     except Exception:
-        return [{"label": "RELIANCE", "value": "RELIANCE.NS"}]
+        return [{"label": "RELIANCE", "value": "RELIANCE"}]
 
 _SYMBOLS = load_symbols_from_csv()
 
@@ -365,6 +442,5 @@ def symbols(q: str = ""):
     data = _SYMBOLS
     if q:
         ql = q.lower()
-        data = [s for s in data
-                if ql in s["label"].lower() or ql in s["value"].lower()]
+        data = [s for s in data if ql in s["label"].lower()]
     return {"symbols": data, "total": len(data)}
